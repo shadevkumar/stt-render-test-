@@ -1,0 +1,1268 @@
+// Load environment variables from .env file
+require('dotenv').config();
+
+const WebSocket = require('ws');
+const { createClient, LiveTranscriptionEvents } = require("@deepgram/sdk");
+const crypto = require('crypto');
+
+// Configuration
+const port = process.env.PORT || 8080;
+const MAX_CONNECTIONS = parseInt(process.env.MAX_CONNECTIONS) || 100;
+const MAX_MESSAGE_SIZE = parseInt(process.env.MAX_MESSAGE_SIZE) || 1024 * 1024; // 1MB default
+const HEARTBEAT_INTERVAL = parseInt(process.env.HEARTBEAT_INTERVAL) || 15000; // 15 seconds default
+const ENABLE_WILDCARD_CORS = process.env.ENABLE_WILDCARD_CORS === 'true';
+const RATE_LIMIT_WINDOW = parseInt(process.env.RATE_LIMIT_WINDOW) || 60000; // 1 minute
+const RATE_LIMIT_MAX_REQUESTS = parseInt(process.env.RATE_LIMIT_MAX_REQUESTS) || 1000; // 1000 requests per minute
+// STT tuning and safety defaults (override via env)
+const DEFAULT_MODEL = process.env.DG_MODEL || process.env.DEEPGRAM_MODEL || 'nova-3';
+const STT_LANGUAGE = process.env.STT_LANGUAGE || process.env.DG_LANGUAGE || 'en';
+const ENDPOINTING_MS = parseInt(process.env.ENDPOINTING_MS || '350');
+const UTTERANCE_END_MS = parseInt(process.env.UTTERANCE_END_MS || '1500');
+const MIN_FINAL_CONFIDENCE = parseFloat(process.env.MIN_FINAL_CONFIDENCE || '0.65');
+const MAX_AUDIO_BUFFER_SIZE = parseInt(process.env.MAX_AUDIO_BUFFER_SIZE || String(64 * 1024)); // 64KB per chunk
+const MAX_KEYTERMS = parseInt(process.env.MAX_KEYTERMS || '40');
+
+// Connection tracking for security
+let currentConnections = 0;
+
+// Rate limiting tracking with automatic cleanup
+const rateLimitMap = new Map(); // Track requests per IP
+
+// Clean up old rate limit entries every minute
+const rateLimitCleanupInterval = setInterval(() => {
+  const now = Date.now();
+  for (const [ip, limit] of rateLimitMap.entries()) {
+    if (now > limit.resetTime + RATE_LIMIT_WINDOW) {
+      rateLimitMap.delete(ip);
+    }
+  }
+}, 60000);
+
+// Connection pool for Deepgram
+const connectionPool = {
+  active: new Map(),
+  idle: [],
+  maxIdle: 5,
+  maxAge: 300000, // 5 minutes
+  // Add connection reuse logic
+  acquire: async function(sessionId) {
+    // Check if we have an idle connection
+    if (this.idle.length > 0) {
+      const conn = this.idle.pop();
+      if (Date.now() - conn.createdAt < this.maxAge) {
+        this.active.set(sessionId, conn);
+        // Return the full connection object, not just the Deepgram connection
+        return conn;
+      }
+      // Connection too old, close it
+      try {
+        conn.connection.finish();
+      } catch (e) {
+        console.log('Error closing stale connection:', e);
+      }
+    }
+    return null; // Need to create new connection
+  },
+  release: function(sessionId) {
+    const conn = this.active.get(sessionId);
+    if (conn) {
+      this.active.delete(sessionId);
+      if (this.idle.length < this.maxIdle) {
+        this.idle.push(conn);
+      } else {
+        // Pool full, close connection
+        try {
+          conn.connection.finish();
+        } catch (e) {
+          console.log('Error closing excess connection:', e);
+        }
+      }
+    }
+  }
+};
+
+// Add finalization tracking
+const finalizationPending = new Map(); // Track sessions waiting for finalization
+const finalizationTimeouts = new Map(); // Track timeouts for each session
+
+// Parse allowed origins from environment variable or use defaults
+const defaultOrigins = [
+  'https://vrplaced-profiling-git-deepgramstt-mythya-verse.vercel.app',
+  'http://localhost:3000',
+  'http://127.0.0.1:3000'
+];
+
+const allowedOrigins = process.env.ALLOWED_ORIGINS 
+  ? process.env.ALLOWED_ORIGINS.split(',').map(origin => origin.trim())
+  : defaultOrigins;
+
+// Helper function for flexible CORS checking
+const isOriginAllowed = (origin) => {
+  if (!origin) return false;
+  
+  // Exact match
+  if (allowedOrigins.includes(origin)) return true;
+  
+  // Wildcard subdomain support if enabled
+  if (ENABLE_WILDCARD_CORS) {
+    // Check for wildcard patterns like *.vrplaced.com
+    return allowedOrigins.some(allowed => {
+      if (allowed.includes('*')) {
+        const pattern = allowed.replace(/\*/g, '.*').replace(/\./g, '\\.');
+        const regex = new RegExp(`^${pattern}$`);
+        return regex.test(origin);
+      }
+      return false;
+    });
+  }
+  
+  return false;
+};
+
+const deepgramApiKey = process.env.DEEPGRAM_API_KEY || process.env.DeepGram_API_Key;
+if (!deepgramApiKey) {
+  console.error('❌ CRITICAL: Deepgram API key not configured!');
+  console.error('Please set either DEEPGRAM_API_KEY or DeepGram_API_Key environment variable');
+  process.exit(1);
+}
+
+// Store active Deepgram connections
+const deepgramConnections = new Map();
+
+// Connection health check functions
+const connectionHealthChecks = new Map();
+
+const startConnectionHealthCheck = (sessionId, ws, deepgramConnection) => {
+  // Clear any existing health check
+  stopConnectionHealthCheck(sessionId);
+  
+  const healthCheck = {
+    lastActivity: Date.now(),
+    checkInterval: setInterval(() => {
+      const now = Date.now();
+      const timeSinceActivity = now - healthCheck.lastActivity;
+      
+      // If no activity for 30 seconds, check connection status
+      if (timeSinceActivity > 30000) {
+        console.log(`⚠️ No Deepgram activity for ${timeSinceActivity}ms on session: ${sessionId}`);
+        
+        // Try to recover the connection
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({
+            type: 'connection_health_warning',
+            sessionId,
+            message: 'Deepgram connection may be stale',
+            lastActivity: healthCheck.lastActivity
+          }));
+        }
+      }
+    }, 15000) // Check every 15 seconds
+  };
+  
+  connectionHealthChecks.set(sessionId, healthCheck);
+};
+
+const stopConnectionHealthCheck = (sessionId) => {
+  const healthCheck = connectionHealthChecks.get(sessionId);
+  if (healthCheck) {
+    clearInterval(healthCheck.checkInterval);
+    connectionHealthChecks.delete(sessionId);
+  }
+};
+
+const updateConnectionActivity = (sessionId) => {
+  const healthCheck = connectionHealthChecks.get(sessionId);
+  if (healthCheck) {
+    healthCheck.lastActivity = Date.now();
+  }
+};
+
+// Function to send finalization complete signal
+const sendFinalizationComplete = (sessionId, ws) => {
+  console.log(`🎉 Sending finalization complete for session: ${sessionId}`);
+  
+  // Clear timeout
+  const timeout = finalizationTimeouts.get(sessionId);
+  if (timeout) {
+    clearTimeout(timeout);
+    finalizationTimeouts.delete(sessionId);
+  }
+  
+  // Remove from pending
+  finalizationPending.delete(sessionId);
+  
+  // Send completion signal to client
+  ws.send(JSON.stringify({
+    type: 'finalization_complete',
+    sessionId,
+    message: 'All final transcripts have been sent',
+    timestamp: Date.now()
+  }));
+};
+
+// Default keywords focused on Node.js interview skills + company/project names
+const defaultKeywords = process.env.DEFAULT_KEYWORDS 
+  ? process.env.DEFAULT_KEYWORDS.split(',').map(kw => kw.trim())
+  : [
+      'VRPlaced',
+      'MythyaVerse',
+      'HR Connect',
+      'Shadev',
+      'Shadev Kumar',
+      'Sumit',
+      'Express.js',
+      'ExpressJS',
+      'Node.js',
+      'NodeJS',
+      'JavaScript',
+      'NestJS',
+      'Fastify',
+      'Koa',
+      'Socket.io',
+      'PM2',
+      'Node.js',
+      'Prisma',
+      'TypeORM',
+      'Sequelize',
+      'Mongoose',
+      'PostgreSQL',
+      'MongoDB',
+      'Redis',
+      'BullMQ',
+      'Kafka',
+      'RabbitMQ',
+      'Docker',
+      'OpenAPI',
+      'Swagger',
+      'Zod',
+      'Joi',
+      'JWT',
+      'bcrypt',
+      'Jest',
+      'Supertest',
+      'Winston',
+      'Morgan',
+      'EventEmitter',
+      'N-API',
+      'V8'
+    ];
+
+console.log('🚀 Starting VRPlaced STT WebSocket Server...');
+console.log(`📡 Port: ${port}`);
+// console.log(`🌐 Allowed Origins ${process.env.ALLOWED_ORIGINS ? '(from env)' : '(defaults)'}: ${allowedOrigins.join(', ')}`);
+// console.log(`🎯 Keywords ${process.env.DEFAULT_KEYWORDS ? '(from env)' : '(defaults)'}: ${defaultKeywords.join(', ')}`);
+// console.log(`🧠 Model: ${DEFAULT_MODEL}, Language: ${STT_LANGUAGE}, Endpointing: ${ENDPOINTING_MS}ms, UtteranceEnd: ${UTTERANCE_END_MS}ms`);
+
+// Create WebSocket server with CORS verification and compression
+const wss = new WebSocket.Server({ 
+  port,
+  maxPayload: MAX_MESSAGE_SIZE,
+  perMessageDeflate: {
+    zlibDeflateOptions: {
+      // Best speed
+      level: 1
+    },
+    threshold: 1024, // Only compress messages larger than 1KB
+    concurrencyLimit: 10
+  },
+  verifyClient: (info, cb) => {
+    const clientIP = info.req.socket.remoteAddress;
+    const origin = info.origin;
+    
+    // TEMPORARY: Simulate WebSocket disabled for testing fallback
+    // const TEMPORARILY_DISABLE_WEBSOCKET_STT = true;
+    // if (TEMPORARILY_DISABLE_WEBSOCKET_STT) {
+    //   console.log('🚫 WebSocket STT temporarily disabled for testing');
+    //   cb(false, 503, 'WebSocket STT temporarily disabled');
+    //   return;
+    // }
+    
+    // Rate limiting check
+    const now = Date.now();
+    const clientRateLimit = rateLimitMap.get(clientIP) || { count: 0, resetTime: now + RATE_LIMIT_WINDOW };
+    
+    if (now > clientRateLimit.resetTime) {
+      clientRateLimit.count = 0;
+      clientRateLimit.resetTime = now + RATE_LIMIT_WINDOW;
+    }
+    
+    if (clientRateLimit.count >= RATE_LIMIT_MAX_REQUESTS) {
+      console.log(`❌ Rate limit exceeded for IP: ${clientIP}`);
+      cb(false, 429, 'Too Many Requests');
+      return;
+    }
+    
+    clientRateLimit.count++;
+    rateLimitMap.set(clientIP, clientRateLimit);
+    
+    // Check connection limit
+    if (currentConnections >= MAX_CONNECTIONS) {
+      console.log(`❌ Rejected connection - max connections reached: ${currentConnections}/${MAX_CONNECTIONS}`);
+      cb(false, 503, 'Service Unavailable - Max Connections Reached');
+      return;
+    }
+    
+    // Check origin with flexible matching
+    const isAllowed = isOriginAllowed(origin);
+    
+    if (!isAllowed) {
+      console.log(`❌ Rejected connection from unauthorized origin: ${origin}`);
+      console.log(`ℹ️  Allowed origins: ${allowedOrigins.join(', ')}`);
+      cb(false, 403, 'Forbidden - Invalid Origin');
+      return;
+    }
+    
+    console.log(`✅ Accepted connection from: ${origin} (${currentConnections + 1}/${MAX_CONNECTIONS})`);
+    console.log(`📊 Client IP: ${clientIP}, Model: ${DEFAULT_MODEL}`);
+    cb(true);
+  }
+});
+
+wss.on('connection', (ws, req) => {
+  const clientOrigin = req.headers.origin;
+  const clientIP = req.socket.remoteAddress;
+  const userAgent = req.headers['user-agent'] || 'Unknown';
+  const connectionTime = Date.now();
+  currentConnections++;
+  
+  console.log(`🔌 New WebSocket connection`);
+  console.log(`   Origin: ${clientOrigin}`);
+  console.log(`   IP: ${clientIP}`);
+  console.log(`   User-Agent: ${userAgent}`);
+  console.log(`   Active Connections: ${currentConnections}/${MAX_CONNECTIONS}`);
+  
+  // Set connection timeout (1 hour max)
+  const connectionTimeout = setTimeout(() => {
+    console.log(`⏰ Connection timeout reached for session: ${sessionId || 'unknown'}`);
+    ws.close(1000, 'Connection timeout');
+  }, 3600000); // 1 hour
+  
+  let sessionId = null;
+  let deepgramConnection = null;
+  let isDeepgramConnected = false;
+  let heartbeatInterval = null;
+  let isAlive = true;
+
+  // Simplified: directly use provided keywords list
+  const parseAndNormalizeKeywords = (rawList) => {
+    if (!Array.isArray(rawList)) return undefined;
+    const cleaned = [];
+    for (const item of rawList) {
+      if (typeof item !== 'string') continue;
+      const term = item.trim();
+      if (!term || term.length < 2) continue;
+      cleaned.push(term.includes(':') ? term : `${term}:1.5`);
+      if (cleaned.length >= MAX_KEYTERMS) break;
+    }
+    return cleaned.length > 0 ? cleaned : undefined;
+  };
+
+  // Sanitize client-provided keyterms (plain strings, no weights)
+  const sanitizeKeyterms = (rawList) => {
+    if (!Array.isArray(rawList)) return undefined;
+    const unique = new Set();
+    for (const item of rawList) {
+      if (typeof item !== 'string') continue;
+      const term = item.trim();
+      if (!term || term.length < 2) continue;
+      unique.add(term);
+      if (unique.size >= MAX_KEYTERMS) break;
+    }
+    return unique.size > 0 ? Array.from(unique) : undefined;
+  };
+
+  const extractKeyterms = (rawList) => {
+    if (!Array.isArray(rawList)) return undefined;
+    const terms = [];
+    for (const item of rawList) {
+      if (typeof item !== 'string') continue;
+      const [termRaw] = item.split(':');
+      const term = termRaw?.trim();
+      if (!term || term.length < 2) continue;
+      terms.push(term);
+      if (terms.length >= MAX_KEYTERMS) break;
+    }
+    return terms.length > 0 ? terms : undefined;
+  };
+
+  // Helper: forward audio buffer to Deepgram with safety checks
+  const forwardAudioToDeepgram = (buffer) => {
+    const currentConnection = deepgramConnection;
+    const currentConnectionState = isDeepgramConnected;
+    if (!currentConnection || !currentConnectionState) {
+      ws.send(JSON.stringify({
+        type: 'error',
+        error: 'Deepgram connection not ready',
+        sessionId,
+        code: 'DEEPGRAM_NOT_READY'
+      }));
+      return;
+    }
+
+    if (!Buffer.isBuffer(buffer)) {
+      return;
+    }
+
+    if (buffer.length > MAX_AUDIO_BUFFER_SIZE) {
+      ws.send(JSON.stringify({
+        type: 'error',
+        error: 'Audio buffer too large',
+        sessionId,
+        code: 'BUFFER_TOO_LARGE'
+      }));
+      return;
+    }
+    if (buffer.length === 0) return;
+
+    try {
+      currentConnection.send(buffer);
+    } catch (sendError) {
+      if (sendError.message?.includes('WebSocket is not open')) {
+        isDeepgramConnected = false;
+        ws.send(JSON.stringify({
+          type: 'error',
+          error: 'Deepgram connection closed during transmission',
+          sessionId,
+          code: 'CONNECTION_CLOSED'
+        }));
+      } else {
+        throw sendError;
+      }
+    }
+  };
+  
+  // Connection health monitoring with configurable interval
+  const startHeartbeat = () => {
+    heartbeatInterval = setInterval(() => {
+      if (ws.readyState === ws.OPEN) {
+        if (!isAlive) {
+          console.log(`💔 Client ${sessionId} failed to respond to ping after ${HEARTBEAT_INTERVAL}ms, terminating connection`);
+          ws.terminate();
+          return;
+        }
+        
+        isAlive = false;
+        ws.ping();
+        if (sessionId) {
+          console.log(`💓 Sent heartbeat ping to session: ${sessionId}`);
+        }
+      }
+    }, HEARTBEAT_INTERVAL);
+  };
+  
+  // Handle pong responses
+  ws.on('pong', () => {
+    isAlive = true;
+    console.log(`💚 Received heartbeat pong from session: ${sessionId}`);
+  });
+  
+  // Handle ping from client (respond with pong)
+  ws.on('ping', () => {
+    console.log(`💛 Received ping from session: ${sessionId}, sending pong`);
+    ws.pong();
+  });
+
+  // Handle incoming WebSocket messages
+  ws.on('message', async (message, isBinary) => {
+    try {
+      // Support binary audio frames directly for lower overhead
+      if (isBinary) {
+        // Validate binary message size
+        if (message.length > MAX_AUDIO_BUFFER_SIZE) {
+          ws.send(JSON.stringify({
+            type: 'error',
+            error: 'Binary audio buffer too large',
+            sessionId,
+            code: 'BINARY_BUFFER_TOO_LARGE',
+            maxSize: MAX_AUDIO_BUFFER_SIZE
+          }));
+          return;
+        }
+        forwardAudioToDeepgram(message);
+        return;
+      }
+
+      const data = JSON.parse(message.toString());
+      
+      // Validate message type
+      if (!data.type || typeof data.type !== 'string') {
+        ws.send(JSON.stringify({
+          type: 'error',
+          error: 'Invalid message: missing or invalid type field',
+          code: 'INVALID_MESSAGE_TYPE'
+        }));
+        return;
+      }
+      
+      switch (data.type) {
+        case 'start_session':
+          // Validate session ID if provided
+          if (data.sessionId) {
+            // Basic validation for session ID format
+            if (typeof data.sessionId !== 'string' || data.sessionId.length > 100) {
+              ws.send(JSON.stringify({
+                type: 'error',
+                error: 'Invalid session ID format',
+                code: 'INVALID_SESSION_ID'
+              }));
+              return;
+            }
+            sessionId = data.sessionId;
+          } else {
+            // Generate secure session ID if not provided
+            sessionId = `ws_${Date.now()}_${crypto.randomBytes(8).toString('hex')}`;
+          }
+          console.log(`🎯 Starting/Refreshing Deepgram session: ${sessionId}`);
+          
+          // Try to reuse connection from pool first
+          // TEMPORARILY DISABLED for stability - always create fresh connections
+          const pooledConn = null; // await connectionPool.acquire(sessionId);
+          if (pooledConn && pooledConn.connection) {
+            console.log(`♻️ Reusing pooled Deepgram connection for session: ${sessionId}`);
+            deepgramConnection = pooledConn.connection;
+            isDeepgramConnected = true;
+            
+            // Store connection reference
+            deepgramConnections.set(sessionId, deepgramConnection);
+            
+            // CRITICAL: Send deepgram_connected even for pooled connections
+            ws.send(JSON.stringify({
+              type: 'deepgram_connected',
+              sessionId,
+              pooled: true
+            }));
+          } else {
+            // Close existing connection if any
+            if (deepgramConnection) {
+              console.log(`🔄 Closing existing Deepgram connection for fresh session`);
+              try {
+                deepgramConnection.finish();
+                deepgramConnections.delete(sessionId);
+              } catch (error) {
+                console.log(`⚠️ Error closing old connection:`, error);
+              }
+              isDeepgramConnected = false;
+              deepgramConnection = null; // CRITICAL: Clear the reference so new connection can be created
+            }
+          }
+          
+          // Create Deepgram client and connection
+          const deepgram = createClient(deepgramApiKey);
+          const isNova3 = typeof DEFAULT_MODEL === 'string' && DEFAULT_MODEL.toLowerCase().startsWith('nova-3');
+
+          // Prefer client-provided keyterms when available
+          const rawClientKeyterms = Array.isArray(data.keyterms)
+            ? data.keyterms
+            : (data.context && Array.isArray(data.context.keyterms) ? data.context.keyterms : undefined);
+          const incomingKeyterms = sanitizeKeyterms(rawClientKeyterms);
+
+          // Fallback to current defaults when client keyterms are not provided
+          const fallbackKeyterms = extractKeyterms(defaultKeywords);
+
+          const liveOptions = {
+            // Formatting & model
+            model: DEFAULT_MODEL,
+            language: STT_LANGUAGE,
+            smart_format: true,
+            punctuate: true,
+            numerals: true,
+
+            // Endpointing and utterance signaling
+            interim_results: true,
+            endpointing: ENDPOINTING_MS,
+            vad_events: true,
+            utterance_end_ms: UTTERANCE_END_MS,
+            paragraphs: true,
+          };
+
+          // Attach contextual vocabulary (Nova-3 keyterm only, no legacy keywords)
+          if (isNova3) {
+            const selectedKeyterms = (incomingKeyterms && incomingKeyterms.length > 0)
+              ? incomingKeyterms
+              : (fallbackKeyterms && fallbackKeyterms.length > 0 ? fallbackKeyterms : undefined);
+            if (selectedKeyterms && selectedKeyterms.length > 0) {
+              liveOptions.keyterm = selectedKeyterms;
+              // Log ALL raw keyterms received/provided for visibility (no slicing)
+              if (Array.isArray(rawClientKeyterms) && rawClientKeyterms.length > 0) {
+                const printableRaw = rawClientKeyterms.map(item => (typeof item === 'string' ? item : JSON.stringify(item)));
+                console.log(`🧩 Raw client keyterms for session ${sessionId} (${printableRaw.length} total):`, printableRaw.join(', '));
+              } else {
+                console.log(`🧩 Raw default keyterms for session ${sessionId} (${defaultKeywords.length} total):`, defaultKeywords.join(', '));
+              }
+              console.log(`🧠 Using ${incomingKeyterms ? 'client-provided' : 'default'} keyterms for session ${sessionId}:`, selectedKeyterms.join(', '));
+            }
+          }
+
+          // Only create new connection if we didn't get one from pool
+          if (!deepgramConnection) {
+            console.log(`🔌 Creating new Deepgram connection for session: ${sessionId}`);
+            try {
+              deepgramConnection = deepgram.listen.live(liveOptions);
+              
+              // Track in pool
+              connectionPool.active.set(sessionId, {
+                connection: deepgramConnection,
+                createdAt: Date.now()
+              });
+            } catch (error) {
+              console.error(`❌ Failed to create Deepgram connection:`, error);
+              ws.send(JSON.stringify({
+                type: 'error',
+                error: 'Failed to create Deepgram connection',
+                code: 'DEEPGRAM_CONNECTION_FAILED',
+                retry: true
+              }));
+              return;
+            }
+          }
+          
+          // Store connection
+          deepgramConnections.set(sessionId, deepgramConnection);
+
+          // Set up Deepgram event listeners
+          deepgramConnection.on(LiveTranscriptionEvents.Open, () => {
+            isDeepgramConnected = true;
+            console.log(`🎤 Deepgram connected for session: ${sessionId}`);
+            ws.send(JSON.stringify({
+              type: 'deepgram_connected',
+              sessionId
+            }));
+            
+            // Start connection health monitoring
+            startConnectionHealthCheck(sessionId, ws, deepgramConnection);
+          });
+
+          deepgramConnection.on(LiveTranscriptionEvents.Transcript, (data) => {
+            // Update connection activity
+            updateConnectionActivity(sessionId);
+            
+            // Check if we have the expected structure
+            if (data && data.channel && data.channel.alternatives && data.channel.alternatives.length > 0) {
+              const transcript = data.channel.alternatives[0].transcript;
+              const confidence = data.channel.alternatives[0].confidence;
+              
+              if (transcript && transcript.trim().length > 0) {
+                // Check if this is a final transcript from CloseStream finalization
+                const isFromFinalize = data.from_finalize === true;
+                
+                if (isFromFinalize) {
+                  console.log(`🏁 FINAL TRANSCRIPT from CloseStream for session ${sessionId}:`, transcript);
+                }
+                
+                // Track final transcripts during finalization
+                if (data.is_final && finalizationPending.has(sessionId)) {
+                  const pending = finalizationPending.get(sessionId);
+                  pending.finalTranscripts.push({
+                    transcript,
+                    timestamp: Date.now()
+                  });
+                  pending.lastTranscriptTime = Date.now();
+                  
+                  console.log(`📝 Tracked final transcript for session ${sessionId}:`, transcript);
+                  
+                  // Reset timeout since we received a transcript
+                  const timeout = finalizationTimeouts.get(sessionId);
+                  if (timeout) {
+                    clearTimeout(timeout);
+                  }
+                  
+                  // Set new timeout (5 seconds from last transcript)
+                  const newTimeout = setTimeout(() => {
+                    console.log(`⏰ No more final transcripts for session ${sessionId} after 5 seconds`);
+                    sendFinalizationComplete(sessionId, ws);
+                  }, 5000);
+                  
+                  finalizationTimeouts.set(sessionId, newTimeout);
+                }
+                
+                ws.send(JSON.stringify({
+                  type: 'transcript',
+                  transcript,
+                  is_final: data.is_final,
+                  speech_final: data.speech_final,
+                  confidence,
+                  confidence_accept: data.is_final ? (typeof confidence === 'number' ? confidence >= MIN_FINAL_CONFIDENCE : true) : true,
+                  min_confidence: MIN_FINAL_CONFIDENCE,
+                  words: data.channel.alternatives[0].words,
+                  from_finalize: isFromFinalize,
+                  sessionId
+                }));
+              }
+            }
+          });
+
+          deepgramConnection.on(LiveTranscriptionEvents.Metadata, (data) => {
+            ws.send(JSON.stringify({
+              type: 'metadata',
+              data,
+              sessionId
+            }));
+          });
+
+          deepgramConnection.on(LiveTranscriptionEvents.Error, (err) => {
+            console.error(`❌ Deepgram error for session ${sessionId}:`, err);
+            // Categorize errors for better handling
+            const errorCode = err.message.includes('quota') ? 'QUOTA_EXCEEDED' :
+                            err.message.includes('auth') ? 'AUTH_ERROR' :
+                            err.message.includes('timeout') ? 'TIMEOUT' :
+                            'DEEPGRAM_ERROR';
+            
+            ws.send(JSON.stringify({
+              type: 'error',
+              error: err.message,
+              sessionId,
+              code: errorCode
+            }));
+            
+            // Auto-retry for transient errors
+            if (errorCode === 'TIMEOUT' && !isDeepgramConnected) {
+              console.log(`🔄 Attempting to reconnect after timeout...`);
+              // Mark for reconnection attempt
+              setTimeout(() => {
+                if (ws.readyState === WebSocket.OPEN) {
+                  ws.send(JSON.stringify({
+                    type: 'reconnect_suggested',
+                    sessionId,
+                    message: 'Connection timeout detected, please restart session'
+                  }));
+                }
+              }, 1000);
+            }
+          });
+
+          deepgramConnection.on(LiveTranscriptionEvents.Close, () => {
+            isDeepgramConnected = false;
+            console.log(`🔚 Deepgram stream closed for session: ${sessionId}`);
+            
+            // Stop health check for this connection
+            stopConnectionHealthCheck(sessionId);
+            
+            // Send finalization complete if we were waiting for it
+            if (finalizationPending.has(sessionId)) {
+              console.log(`🎉 Stream closed, sending finalization complete for session: ${sessionId}`);
+              sendFinalizationComplete(sessionId, ws);
+            }
+            
+            // Notify client that Deepgram stream is closed but WebSocket stays alive
+            ws.send(JSON.stringify({
+              type: 'deepgram_stream_closed',
+              sessionId,
+              message: 'Deepgram stream finalized, ready for next session'
+            }));
+            
+            // Don't delete the connection from the map yet - we might recreate it
+            // deepgramConnections.delete(sessionId); // REMOVED - keep for potential restart
+          });
+
+          // Start heartbeat monitoring after session is established
+          startHeartbeat();
+          
+          // Confirm session started
+          ws.send(JSON.stringify({
+            type: 'session_started',
+            sessionId
+          }));
+          break;
+
+        case 'audio_data':
+          // Validate audio data format
+          if (!data.audio || typeof data.audio !== 'string') {
+            console.error(`❌ Invalid audio data format for session ${sessionId}`);
+            ws.send(JSON.stringify({
+              type: 'error',
+              error: 'Invalid audio data format',
+              sessionId,
+              code: 'INVALID_AUDIO_FORMAT'
+            }));
+            return;
+          }
+
+          // Send audio data directly to Deepgram with enhanced error handling
+          try {
+            const buffer = Buffer.from(data.audio, 'base64');
+            forwardAudioToDeepgram(buffer);
+          } catch (error) {
+            console.error(`❌ Failed to send audio data for session ${sessionId}:`, error);
+            ws.send(JSON.stringify({
+              type: 'error',
+              error: 'Failed to process audio data',
+              sessionId,
+              code: 'AUDIO_PROCESSING_ERROR',
+              details: error.message
+            }));
+          }
+          break;
+
+        case 'end_session':
+          if (deepgramConnection) {
+            try {
+              console.log(`🛑 Ending session: ${sessionId}`);
+              deepgramConnection.finish();
+              deepgramConnections.delete(sessionId);
+            } catch (error) {
+              console.error(`❌ Error ending session ${sessionId}:`, error);
+            }
+          }
+          break;
+
+        case 'ping':
+          // Handle client ping for connection health check
+          ws.send(JSON.stringify({
+            type: 'pong',
+            sessionId,
+            timestamp: Date.now()
+          }));
+          console.log(`🏓 Responded to ping from session: ${sessionId}`);
+          break;
+
+        case 'pong':
+          // Client responded to our ping
+          isAlive = true;
+          console.log(`✅ Received pong response from session: ${sessionId}`);
+          break;
+
+        case 'keep_alive':
+          // Forward KeepAlive to Deepgram
+          if (deepgramConnection && isDeepgramConnected) {
+            try {
+              deepgramConnection.keepAlive();
+              console.log(`🫀 Forwarded KeepAlive to Deepgram for session: ${sessionId}`);
+            } catch (error) {
+              console.error(`❌ Failed to send KeepAlive for session ${sessionId}:`, error);
+            }
+          }
+          break;
+
+        case 'close_stream':
+          // Send CloseStream message to Deepgram to get final transcripts
+          if (deepgramConnection && isDeepgramConnected) {
+            try {
+              console.log(`🏁 Sending CloseStream to Deepgram for session: ${sessionId}`);
+              
+              // Mark this session as pending finalization
+              finalizationPending.set(sessionId, {
+                startTime: Date.now(),
+                finalTranscripts: [],
+                lastTranscriptTime: Date.now()
+              });
+              
+              // Send the CloseStream message as per Deepgram docs
+              const closeStreamMsg = JSON.stringify({ type: 'CloseStream' });
+              deepgramConnection.send(closeStreamMsg);
+              
+              console.log(`✅ CloseStream message sent for session: ${sessionId}`);
+              
+              // Notify client that CloseStream was sent
+              ws.send(JSON.stringify({
+                type: 'close_stream_sent',
+                sessionId,
+                message: 'Waiting for final transcripts'
+              }));
+              
+              // Set up finalization timeout (10 seconds)
+              const finalizationTimeout = setTimeout(() => {
+                console.log(`⏰ Finalization timeout reached for session: ${sessionId}`);
+                sendFinalizationComplete(sessionId, ws);
+              }, 10000); // 10 seconds timeout
+              
+              finalizationTimeouts.set(sessionId, finalizationTimeout);
+              
+            } catch (error) {
+              console.error(`❌ Failed to send CloseStream for session ${sessionId}:`, error);
+              ws.send(JSON.stringify({
+                type: 'error',
+                error: 'Failed to close Deepgram stream',
+                sessionId,
+                code: 'CLOSE_STREAM_ERROR'
+              }));
+            }
+          } else {
+            console.warn(`⚠️ CloseStream requested but Deepgram not connected for session ${sessionId}`);
+            ws.send(JSON.stringify({
+              type: 'error',
+              error: 'Deepgram not connected',
+              sessionId,
+              code: 'DEEPGRAM_NOT_CONNECTED'
+            }));
+          }
+          break;
+
+        case 'finalize':
+          // Send Finalize message to Deepgram to flush and get final transcripts without closing stream
+          if (deepgramConnection && isDeepgramConnected) {
+            try {
+              console.log(`✅ Sending Finalize to Deepgram for session: ${sessionId}`);
+
+              // Mark this session as pending finalization (reuse same tracking)
+              finalizationPending.set(sessionId, {
+                startTime: Date.now(),
+                finalTranscripts: [],
+                lastTranscriptTime: Date.now()
+              });
+
+              const finalizeMsg = JSON.stringify({ type: 'Finalize' });
+              deepgramConnection.send(finalizeMsg);
+
+              ws.send(JSON.stringify({
+                type: 'finalize_sent',
+                sessionId,
+                message: 'Waiting for final transcripts'
+              }));
+
+              // Use same timeout window as close_stream
+              const finalizeTimeout = setTimeout(() => {
+                console.log(`⏰ Finalize timeout reached for session: ${sessionId}`);
+                sendFinalizationComplete(sessionId, ws);
+              }, 10000);
+              finalizationTimeouts.set(sessionId, finalizeTimeout);
+            } catch (error) {
+              console.error(`❌ Failed to send Finalize for session ${sessionId}:`, error);
+              ws.send(JSON.stringify({
+                type: 'error',
+                error: 'Failed to finalize Deepgram stream',
+                sessionId,
+                code: 'FINALIZE_ERROR'
+              }));
+            }
+          } else {
+            console.warn(`⚠️ Finalize requested but Deepgram not connected for session ${sessionId}`);
+            ws.send(JSON.stringify({
+              type: 'error',
+              error: 'Deepgram not connected',
+              sessionId,
+              code: 'DEEPGRAM_NOT_CONNECTED'
+            }));
+          }
+          break;
+
+        default:
+          console.log(`❓ Unknown message type: ${data.type}`);
+          break;
+      }
+    } catch (error) {
+      console.error('❌ Error processing message:', error);
+      ws.send(JSON.stringify({
+        type: 'error',
+        error: 'Invalid message format'
+      }));
+    }
+  });
+
+  // Centralized cleanup function
+  const cleanupConnection = () => {
+    console.log(`🧹 Cleaning up session: ${sessionId}`);
+    
+    // Clear connection timeout
+    if (connectionTimeout) {
+      clearTimeout(connectionTimeout);
+    }
+    
+    // Decrement connection count
+    currentConnections = Math.max(0, currentConnections - 1);
+    console.log(`📊 Connections: ${currentConnections}/${MAX_CONNECTIONS}`);
+    
+    // Clean up heartbeat interval
+    if (heartbeatInterval) {
+      clearInterval(heartbeatInterval);
+      heartbeatInterval = null;
+      console.log(`💔 Stopped heartbeat for session: ${sessionId}`);
+    }
+    
+    // Clean up health check
+    if (sessionId) {
+      stopConnectionHealthCheck(sessionId);
+    }
+    
+    // Clean up finalization tracking
+    if (sessionId) {
+      const timeout = finalizationTimeouts.get(sessionId);
+      if (timeout) {
+        clearTimeout(timeout);
+        finalizationTimeouts.delete(sessionId);
+      }
+      finalizationPending.delete(sessionId);
+    }
+    
+    // Try to return connection to pool instead of closing
+    if (deepgramConnection && sessionId) {
+      const conn = connectionPool.active.get(sessionId);
+      if (conn && Date.now() - conn.createdAt < connectionPool.maxAge) {
+        // Connection is still fresh, return to pool
+        connectionPool.release(sessionId);
+        console.log(`♻️ Returned connection to pool for session: ${sessionId}`);
+      } else {
+        // Connection too old or not in pool, close it
+        try {
+          deepgramConnection.finish();
+          if (sessionId) {
+            deepgramConnections.delete(sessionId);
+            connectionPool.active.delete(sessionId);
+          }
+        } catch (error) {
+          console.error(`❌ Error cleaning up session ${sessionId}:`, error);
+        }
+      }
+    }
+  };
+
+  // Handle WebSocket close
+  ws.on('close', () => {
+    console.log(`🔌 WebSocket connection closed for session: ${sessionId}`);
+    cleanupConnection();
+  });
+
+  // Handle WebSocket errors
+  ws.on('error', (error) => {
+    console.error(`❌ WebSocket error for session ${sessionId}:`, error);
+    cleanupConnection();
+  });
+
+  // Send initial connection confirmation
+  ws.send(JSON.stringify({
+    type: 'connected',
+    message: 'WebSocket connection established'
+  }));
+});
+
+// Handle server events
+wss.on('listening', () => {
+  console.log(`✅ VRPlaced STT WebSocket Server listening on port ${port}`);
+  console.log(`🌍 Server ready to accept connections from allowed origins`);
+});
+
+wss.on('error', (error) => {
+  console.error('❌ WebSocket server error:', error);
+});
+
+// Graceful shutdown
+process.on('SIGINT', () => {
+  console.log('\n🛑 Shutting down VRPlaced STT WebSocket Server...');
+  
+  // Close all active Deepgram connections
+  console.log(`🧹 Cleaning up ${deepgramConnections.size} active connections...`);
+  deepgramConnections.forEach((connection, sessionId) => {
+    try {
+      connection.finish();
+      console.log(`✅ Cleaned up session: ${sessionId}`);
+    } catch (error) {
+      console.error(`❌ Error cleaning up session ${sessionId}:`, error);
+    }
+  });
+  
+  // Clean up connection pool
+  console.log(`♻️ Cleaning up ${connectionPool.idle.length} pooled connections...`);
+  connectionPool.idle.forEach(conn => {
+    try {
+      conn.connection.finish();
+    } catch (error) {
+      console.error('Error closing pooled connection:', error);
+    }
+  });
+  connectionPool.active.forEach((conn, sessionId) => {
+    try {
+      conn.connection.finish();
+      console.log(`✅ Cleaned up pooled session: ${sessionId}`);
+    } catch (error) {
+      console.error(`❌ Error cleaning up pooled session ${sessionId}:`, error);
+    }
+  });
+  
+  // Clear rate limit tracking
+  rateLimitMap.clear();
+  
+  // Clear intervals
+  clearInterval(rateLimitCleanupInterval);
+  
+  // Close WebSocket server
+  wss.close(() => {
+    console.log('✅ WebSocket server closed');
+    
+    // Close health server
+    healthServer.close(() => {
+      console.log('✅ Health check server closed');
+      process.exit(0);
+    });
+  });
+});
+
+// Health check and HTTP API endpoint (for Railway and HTTP fallback)
+const http = require('http');
+const { URL } = require('url');
+const multiparty = require('multiparty');
+const fs = require('fs').promises;
+
+// Deepgram REST API for HTTP fallback
+const transcribeWithDeepgramRest = async (audioBuffer, options = {}) => {
+  try {
+    const deepgram = createClient(deepgramApiKey);
+    
+    // Prepare options
+    const transcriptionOptions = {
+      model: options.model || DEFAULT_MODEL,
+      language: options.language || STT_LANGUAGE,
+      smart_format: options.smart_format !== false,
+      punctuate: options.punctuate !== false,
+      numerals: options.numerals !== false,
+    };
+    
+    // Add keywords/keyterm based on model (Nova 3 uses 'keyterm', others use 'keywords')
+    if (options.keywords && Array.isArray(options.keywords)) {
+      const isNova3 = transcriptionOptions.model.toLowerCase().includes('nova-3');
+      if (isNova3) {
+        // Nova 3 uses 'keyterm' parameter
+        transcriptionOptions.keyterm = options.keywords;
+        console.log('🔍 HTTP: Using keyterms for Nova-3:', options.keywords);
+      } else {
+        transcriptionOptions.keywords = options.keywords;
+        console.log('🔍 HTTP: Using keywords:', options.keywords);
+      }
+    }
+    
+    console.log('🎙️ HTTP: Starting Deepgram REST transcription', {
+      bufferSize: audioBuffer.length,
+      options: transcriptionOptions
+    });
+    
+    // Use Deepgram SDK v4 for REST API
+    const { result, error } = await deepgram.listen.prerecorded.transcribeFile(
+      audioBuffer,
+      transcriptionOptions
+    );
+    
+    if (error) {
+      throw error;
+    }
+    
+    // Extract transcript from response
+    const transcript = result?.results?.channels?.[0]?.alternatives?.[0];
+    
+    return {
+      transcript: transcript?.transcript || '',
+      confidence: transcript?.confidence || 0,
+      words: transcript?.words || []
+    };
+    
+  } catch (error) {
+    console.error('❌ Deepgram REST API error:', error);
+    throw error;
+  }
+};
+
+const healthServer = http.createServer(async (req, res) => {
+  const url = new URL(req.url || '', `http://${req.headers.host || 'localhost'}`);
+  const pathname = url.pathname;
+  
+  // Enable CORS for HTTP endpoints
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-Client-Type, X-Connection-Mode');
+  
+  // Handle preflight
+  if (req.method === 'OPTIONS') {
+    res.writeHead(200);
+    res.end();
+    return;
+  }
+  
+  if (pathname === '/health') {
+    const health = {
+      status: 'healthy',
+      activeConnections: currentConnections,
+      maxConnections: MAX_CONNECTIONS,
+      deepgramSessions: deepgramConnections.size,
+      connectionPool: {
+        active: connectionPool.active.size,
+        idle: connectionPool.idle.length
+      },
+      uptime: process.uptime(),
+      memoryUsage: process.memoryUsage(),
+      timestamp: new Date().toISOString()
+    };
+    
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(health));
+    
+  } else if (pathname === '/api/transcribe' && req.method === 'POST') {
+    // HTTP fallback transcription endpoint
+    console.log('📨 HTTP: Received transcription request');
+    
+    const form = new multiparty.Form({
+      maxFilesSize: 10 * 1024 * 1024 // 10MB max
+    });
+    
+    form.parse(req, async (err, fields, files) => {
+      if (err) {
+        console.error('❌ HTTP: Form parsing error:', err);
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Invalid form data' }));
+        return;
+      }
+      
+      try {
+        // Get audio file
+        const audioFile = files.audio?.[0];
+        if (!audioFile) {
+          throw new Error('No audio file provided');
+        }
+        
+        // Read audio file
+        const audioBuffer = await fs.readFile(audioFile.path);
+        
+        // Parse options
+        const options = {
+          model: fields.model?.[0],
+          language: fields.language?.[0],
+          smart_format: fields.smart_format?.[0] === 'true',
+          punctuate: fields.punctuate?.[0] === 'true',
+          numerals: fields.numerals?.[0] === 'true',
+        };
+        
+        // Parse keywords if provided
+        if (fields.keywords?.[0]) {
+          try {
+            options.keywords = JSON.parse(fields.keywords[0]);
+            console.log('📝 HTTP: Received keywords:', options.keywords);
+          } catch (e) {
+            console.warn('Failed to parse keywords:', e);
+          }
+        } else {
+          console.log('📝 HTTP: No keywords provided in request');
+        }
+        
+        // Transcribe using Deepgram REST API
+        const result = await transcribeWithDeepgramRest(audioBuffer, options);
+        
+        // Send response
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(result));
+        
+        // Cleanup temp file
+        await fs.unlink(audioFile.path).catch(() => {});
+        
+        console.log('✅ HTTP: Transcription completed', {
+          transcriptLength: result.transcript?.length || 0,
+          confidence: result.confidence
+        });
+        
+      } catch (error) {
+        console.error('❌ HTTP: Transcription error:', error);
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ 
+          error: 'Transcription failed', 
+          message: error.message 
+        }));
+      }
+    });
+    
+  } else {
+    res.writeHead(404);
+    res.end('Not Found');
+  }
+});
+
+// Start health check server on a different port
+const healthPort = parseInt(port) + 1;
+healthServer.listen(healthPort, () => {
+  console.log(`💊 Health check server running on port ${healthPort}`);
+  console.log(`🌐 HTTP API available at http://localhost:${healthPort}/api/transcribe`);
+});
