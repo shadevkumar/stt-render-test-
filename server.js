@@ -565,13 +565,18 @@ wss.on('connection', (ws, req) => {
     const currentConnectionState = state?.isConnected || isDeepgramConnected;
 
     if (!currentConnection || !currentConnectionState) {
-      console.warn(`⚠️ Audio rejected: connection=${!!currentConnection}, isConnected=${currentConnectionState}, sessionId=${sessionId}`);
-      ws.send(JSON.stringify({
-        type: 'error',
-        error: 'Deepgram connection not ready',
-        sessionId,
-        code: 'DEEPGRAM_NOT_READY'
-      }));
+      // BUFFER AUDIO instead of rejecting - Deepgram may still be connecting
+      if (audioRetryQueue.length < 100) { // Max 100 chunks (~15 seconds of audio)
+        audioRetryQueue.push(buffer);
+        if (audioRetryQueue.length === 1) {
+          console.log(`📦 Buffering audio while Deepgram connects for session: ${sessionId}`);
+        }
+        if (audioRetryQueue.length % 20 === 0) {
+          console.log(`📦 Audio buffer size: ${audioRetryQueue.length} chunks for session: ${sessionId}`);
+        }
+      } else {
+        console.warn(`⚠️ Audio buffer full (100 chunks), dropping audio for session: ${sessionId}`);
+      }
       return;
     }
 
@@ -1117,7 +1122,21 @@ wss.on('connection', (ws, req) => {
             // Update BOTH per-session state AND legacy flag (for backward compatibility)
             state.isConnected = true;
             isDeepgramConnected = true;
-            
+
+            // CRITICAL FIX: Flush any audio that was buffered while waiting for Deepgram to connect
+            if (audioRetryQueue.length > 0) {
+              console.log(`📤 Flushing ${audioRetryQueue.length} buffered audio chunks now that Deepgram is connected`);
+              const queue = [...audioRetryQueue];
+              audioRetryQueue = [];
+              queue.forEach(queuedBuffer => {
+                try {
+                  deepgramConnection.send(queuedBuffer);
+                } catch (err) {
+                  console.error(`❌ Failed to flush buffered audio: ${err.message}`);
+                }
+              });
+            }
+
             const sessionLang = sessionLanguages.get(currentSessionId) || 'unknown';
             console.log(`🎤 Deepgram connected for session: ${currentSessionId} (language: ${sessionLang}, connId: ${connectionId})`);
 
