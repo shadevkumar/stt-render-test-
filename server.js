@@ -749,16 +749,65 @@ wss.on('connection', (ws, req) => {
       
       switch (data.type) {
         case 'start_session':
-          // CRITICAL FIX: Prevent sessionId reassignment mid-session
+          // AUTO-CLEANUP: If session is locked, cleanup old session before starting new one
+          // This makes the server resilient to client timing issues (client may send start_session
+          // before end_session arrives, especially in persistent WebSocket mode)
           if (sessionIdLocked) {
-            console.warn(`⚠️ Attempted to reassign sessionId for active session: ${sessionId}`);
-            ws.send(JSON.stringify({
-              type: 'error',
-              error: 'Session already initialized. Cannot change session ID mid-session.',
-              sessionId,
-              code: 'SESSION_ALREADY_INITIALIZED'
-            }));
-            return;
+            console.log(`🔄 Auto-cleanup: Ending existing session ${sessionId} before starting new one`);
+
+            // Cleanup old session (same logic as end_session)
+            if (heartbeatInterval) {
+              clearInterval(heartbeatInterval);
+              heartbeatInterval = null;
+            }
+
+            const oldSessionState = getSessionState(sessionId);
+            if (oldSessionState?.heartbeatInterval) {
+              clearInterval(oldSessionState.heartbeatInterval);
+              oldSessionState.heartbeatInterval = null;
+            }
+
+            // Close existing Deepgram connection
+            if (deepgramConnection) {
+              try {
+                deepgramConnection.finish();
+                deepgramConnections.delete(sessionId);
+              } catch (err) {
+                console.warn(`⚠️ Auto-cleanup: Error closing old Deepgram connection:`, err.message);
+              }
+            }
+
+            // Close existing Sarvam connection
+            if (sarvamConnection && sarvamWebSocketService) {
+              try {
+                await sarvamWebSocketService.closeSession(sessionId);
+                sarvamConnection = null;
+                isSarvamConnected = false;
+              } catch (err) {
+                console.warn(`⚠️ Auto-cleanup: Error closing old Sarvam connection:`, err.message);
+              }
+            }
+
+            // Cleanup state
+            connectionProviders.delete(sessionId);
+            sessionLanguages.delete(sessionId);
+            lastSpeechFinalTime.delete(sessionId);
+            silentFailureTracking.delete(sessionId);
+            stopConnectionHealthCheck(sessionId);
+            if (sessionId) {
+              cleanupSessionState(sessionId);
+            }
+
+            // Reset state for new session
+            sessionId = null;
+            sessionIdLocked = false;
+            isDeepgramConnected = false;
+            isSarvamConnected = false;
+            deepgramConnection = null;
+            audioRetryQueue = [];
+            lastSessionEndTime = Date.now();
+
+            console.log(`✅ Auto-cleanup complete, ready for new session`);
           }
 
           // ================================================================
